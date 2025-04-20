@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,20 +15,13 @@
 import argparse
 import logging
 import os
-from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
 from trl import TrlParser
-from trl.import_utils import (
-    is_fastapi_available,
-    is_pydantic_available,
-    is_uvicorn_available,
-    is_vllm_ascend_available,
-    is_vllm_available,
-)
+from trl.import_utils import is_fastapi_available, is_pydantic_available, is_uvicorn_available, is_vllm_available
 
 
 if is_fastapi_available():
@@ -44,15 +37,35 @@ if is_uvicorn_available():
 
 
 if is_vllm_available():
+    def _return_nothing(*args, **kwargs): return None
+    import vllm.transformers_utils.tokenizer
+    vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
+    vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
+        
+    import vllm.transformers_utils.tokenizer_group.tokenizer_group
+    vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer = _return_nothing
+    vllm.transformers_utils.tokenizer_group.tokenizer_group.get_lora_tokenizer_async = _return_nothing
+    from ..scripts.vllm_patch import (
+    LoRARequest as PatchedLoRARequest,
+    WorkerLoRAManager as PatchedWorkerLoRAManager,
+    LRUCacheWorkerLoRAManager as PatchedLRUCacheWorkerLoRAManager,
+    )
+    def patch():
+        import vllm.lora.request
+        vllm.lora.request.LoRARequest = PatchedLoRARequest
+        import vllm.lora.worker_manager
+        vllm.lora.worker_manager.LoRARequest = PatchedLoRARequest
+        vllm.lora.worker_manager.WorkerLoRAManager = PatchedWorkerLoRAManager
+        vllm.lora.worker_manager.LRUCacheWorkerLoRAManager = PatchedLRUCacheWorkerLoRAManager
+    patch()
     from vllm import LLM, SamplingParams
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.parallel_state import get_world_group
     from vllm.distributed.utils import StatelessProcessGroup
     from vllm.sampling_params import GuidedDecodingParams
-
-    if is_vllm_ascend_available():
-        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
-
+    from vllm.worker.worker import Worker
+else:
+    Worker = object
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +75,29 @@ logger = logging.getLogger(__name__)
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
-class WeightSyncWorkerExtension:
+class WeightSyncWorker(Worker):
     """
-    A vLLM worker extension that enables weight synchronization between a client and multiple server workers.
+    A vLLM worker that enables weight synchronization between a client and multiple server workers.
 
     This worker uses a `StatelessProcessGroup` to establish communication and a `PyNcclCommunicator` to handle
     efficient GPU-based communication using NCCL. The primary purpose of this class is to receive updated model weights
     from a client process and distribute them to all worker processes participating in model inference.
     """
 
-    # The following attributes are initialized when `init_communicator` method is called.
-    pynccl_comm = None  # Communicator for weight updates
-    client_rank = None  # Source rank for broadcasting updated weights
+    def __init__(self, *args, **kwargs):
+        if not is_vllm_available():
+            raise ImportError(
+                "vLLM is required to use the WeightSyncWorker. Please install it using `pip install vllm`."
+            )
+
+        super().__init__(*args, **kwargs)
+
+        # The following attributes are initialized when `init_communicator` method is called.
+        self.pynccl_comm = None  # Communicator for weight updates
+        self.client_rank = None  # Source rank for broadcasting updated weights
+        self.lora_weight = {}
+        self.lora_requests = None
+        self.lora_id=0
 
     def init_communicator(self, host: str, port: int, world_size: int) -> None:
         """
@@ -90,6 +114,10 @@ class WeightSyncWorkerExtension:
             world_size (`int`):
                 Total number of participating processes in the update group.
         """
+        if self.pynccl_comm is not None:
+            del self.pynccl_comm
+            self.pynccl_comm = None  # Ensure attribute is reset to None
+            self.client_rank = None
         if self.pynccl_comm is not None:
             raise RuntimeError("Weight update group already initialized. Call close_communicator first.")
 
@@ -124,11 +152,38 @@ class WeightSyncWorkerExtension:
         weight = torch.empty(shape, dtype=dtype, device=self.device)
 
         # Use NCCL to broadcast the updated weights from the client (src) to all workers.
-        self.pynccl_comm.broadcast(weight, src=self.client_rank)
+        self.pynccl_comm.broadcast(weight, src=self.client_rank, stream=torch.cuda.current_stream())
         self.pynccl_comm.group.barrier()
 
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
+
+    def update_lora_param(self, name: str, dtype: torch.dtype, shape: Sequence[int]) -> None:
+        """
+        Receives updated weights from the client process and updates the named parameter in the model.
+
+        Args:
+            name (`str`):
+                Name of the weight tensor being updated.
+            dtype (`torch.dtype`):
+                Data type of the weight tensor (e.g., `torch.float32`).
+            shape (`Sequence[int]`):
+                Shape of the weight tensor.
+        """
+        if self.pynccl_comm is None:
+            raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
+
+        # Allocate memory for the incoming weight tensor on the correct device.
+        weight = torch.empty(shape, dtype=dtype, device=self.device)
+
+        # Use NCCL to broadcast the updated weights from the client (src) to all workers.
+        self.pynccl_comm.broadcast(weight, src=self.client_rank, stream=torch.cuda.current_stream())
+        self.pynccl_comm.group.barrier()
+
+        # Load the received weights into the model.
+        self.lora_weight[name]=weight
+
+    
 
     def close_communicator(self) -> None:
         """
@@ -251,12 +306,15 @@ def main(script_args: ScriptArguments):
         tensor_parallel_size=script_args.tensor_parallel_size,
         gpu_memory_utilization=script_args.gpu_memory_utilization,
         dtype=script_args.dtype,
+        enable_lora=True,
+        max_lora_rank=32,
+        max_cpu_loras=1,
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
         # This is particularly useful here because we generate completions from the same prompts.
         enable_prefix_caching=script_args.enable_prefix_caching,
         max_model_len=script_args.max_model_len,
-        worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
+        worker_cls=WeightSyncWorker,
     )
 
     app = FastAPI()
@@ -283,7 +341,7 @@ def main(script_args: ScriptArguments):
         {"tensor_parallel_size": 8}
         ```
         """
-        return {"tensor_parallel_size": llm.llm_engine.vllm_config.parallel_config.tensor_parallel_size}
+        return {"tensor_parallel_size": llm.llm_engine.parallel_config.tensor_parallel_size}
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
@@ -322,7 +380,7 @@ def main(script_args: ScriptArguments):
         {"completion_ids": [[101, 102, 103], [201, 202, 203]]}
         ```
         """
-
+        lora_worker = llm.llm_engine.model_executor.driver_worker
         # Guided decoding, if enabled
         if request.guided_decoding_regex is not None:
             guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
@@ -340,9 +398,61 @@ def main(script_args: ScriptArguments):
             max_tokens=request.max_tokens,
             guided_decoding=guided_decoding,
         )
-        all_outputs = llm.generate(request.prompts, sampling_params=sampling_params)
+        if lora_worker.lora_requests:
+            all_outputs = llm.generate(request.prompts, sampling_params=sampling_params,lora_request=lora_worker.lora_requests)
+        else:
+            all_outputs = llm.generate(request.prompts, sampling_params=sampling_params)
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         return {"completion_ids": completion_ids}
+    
+
+    class ScoreResponse(BaseModel):
+        score: list[str]
+    @app.post("/score/", response_model=ScoreResponse)
+    async def score(request: GenerateRequest):
+        """
+        Generates completions for the provided prompts.
+
+        Args:
+            request (`GenerateRequest`):
+                - `prompts` (list of `str`): A list of prompts (text strings) for the model to generate completions.
+
+        Returns:
+            `GenerateResponse`:
+                - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
+
+        Example request:
+        ```json
+        {"prompts": ["Hello world", "What is AI?"]}
+        ```
+
+        Example response:
+        ```json
+        {"completion_ids": [[101, 102, 103], [201, 202, 203]]}
+        ```
+        """
+        if request.guided_decoding_regex is not None:
+            guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
+        else:
+            guided_decoding = None
+
+        # Sampling parameters
+        sampling_params = SamplingParams(
+            n=request.n,
+            repetition_penalty=request.repetition_penalty,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            min_p=request.min_p,
+            max_tokens=request.max_tokens
+        )
+        
+        all_outputs = llm.generate(request.prompts, sampling_params=sampling_params)
+        score_list=[]
+        for output in all_outputs:
+            for canidate in output.outputs:
+                score_list.append(canidate.text)
+        return {"score": score_list}
 
     class InitCommunicatorRequest(BaseModel):
         host: str
@@ -396,7 +506,56 @@ def main(script_args: ScriptArguments):
         background_tasks.add_task(llm.collective_rpc, "update_named_param", args=(request.name, dtype, request.shape))
 
         return {"message": "Request received, updating named parameter"}
+    
 
+    class UpdateWeightsRequest(BaseModel):
+        name: str
+        dtype: str
+        shape: list[int]
+
+    @app.post("/update_lora_param/")
+    async def update_lora_param(request: UpdateWeightsRequest, background_tasks: BackgroundTasks):
+        """
+        Updates the model weights with the provided tensor.
+
+        Once this endpoint is called, the client process should broadcast the updated weights to all server workers.
+
+        Args:
+            request (`UpdateWeightsRequest`):
+                - `name` (`str`): Name of the weight tensor being updated.
+                - `dtype` (`str`): Data type of the weight tensor (e.g., `"torch.float32"`).
+                - `shape` (list of `int`): Shape of the weight
+
+        """
+        # The function is called this way: update_named_param(name="name", dtype=torch.float32, shape=(10, 10))
+        # So with collect_rpc we need to call it this way:
+        # llm.collective_rpc("update_named_param", args=("name", torch.float32, (10, 10)))
+        # And with background_tasks.add_task we need to call it this way:
+        # background_tasks.add_task(llm.collective_rpc, "update_named_param", args=("name", torch.float32, (10, 10)))
+        dtype = torch.__getattribute__(request.dtype.split(".")[-1])
+        background_tasks.add_task(llm.collective_rpc, "update_lora_param", args=(request.name, dtype, request.shape))
+        return {"message": "Request received, updating lora parameter"}
+    
+    class ApplyLoraRequest(BaseModel):
+        lora_config: dict
+
+    @app.post("/apply_lora/")
+    def apply_lora(request: ApplyLoraRequest, background_tasks: BackgroundTasks):
+            lora_worker = llm.llm_engine.model_executor.driver_worker
+            lora_weights = lora_worker.lora_weight
+            lora_config = request.lora_config
+            from vllm.lora.request import LoRARequest
+            lora_request = LoRARequest(
+                lora_name=str(lora_worker.lora_id),
+                lora_int_id=lora_worker.lora_id,
+                lora_tensors=lora_weights,
+                lora_config=lora_config,
+            )
+            lora_worker.lora_id=lora_worker.lora_id+1
+            lora_worker.lora_requests=lora_request
+            return {"message": f"LoRA applied with ID: {lora_worker.lora_id}", "lora_id": lora_worker.lora_id}
+    
+    
     @app.post("/reset_prefix_cache/")
     async def reset_prefix_cache():
         """
